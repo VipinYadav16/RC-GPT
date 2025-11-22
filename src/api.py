@@ -9,9 +9,22 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import os
 import pickle
+from dotenv import load_dotenv
+
+# Configuration
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+env_path = os.path.join(BASE_DIR, ".env")
+
+# Load environment variables from .env file
+load_dotenv(env_path)
+
+print(f"DEBUG: Loaded .env from {env_path}")
+print(f"DEBUG: PINECONE_API_KEY status: {'Found' if os.getenv('PINECONE_API_KEY') else 'Missing'}")
+
 from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
-from langchain_community.vectorstores import FAISS
+from langchain_pinecone import PineconeVectorStore
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import StrOutputParser
 from langchain.chains import create_retrieval_chain
 from langchain.chains.combine_documents import create_stuff_documents_chain
 from langchain_community.retrievers import BM25Retriever
@@ -19,10 +32,11 @@ from langchain.retrievers import EnsembleRetriever
 import re
 
 # Configuration
-VECTOR_STORE_PATH = "../storage/vector_store"
-PROCESSED_DATA_FILE = "../storage/processed_data/all_documents.pkl"
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PROCESSED_DATA_FILE = os.path.join(BASE_DIR, "storage", "processed_data", "all_documents.pkl")
 MODEL_NAME = "models/gemini-2.0-flash-exp"
 RETRIEVAL_K = 15
+PINECONE_INDEX_NAME = "caselawgpt-index"
 
 # Initialize FastAPI
 app = FastAPI(
@@ -34,7 +48,7 @@ app = FastAPI(
 # CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:5173"],  # React dev servers
+    allow_origins=["http://localhost:3000", "http://localhost:3001", "http://localhost:5173"],  # React dev servers
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -46,7 +60,6 @@ class QueryRequest(BaseModel):
     year_range: Optional[List[int]] = [1950, 2025]
     tort_types: Optional[List[str]] = []
     max_sources: Optional[int] = 5
-    faiss_weight: Optional[float] = 0.7
 
 class Source(BaseModel):
     case_name: str
@@ -68,6 +81,8 @@ class StatsResponse(BaseModel):
 
 # Global state
 retrieval_chain = None
+general_chain = None
+classification_chain = None
 use_hybrid = False
 all_documents = []
 
@@ -139,41 +154,84 @@ def detect_statute_citations(text: str) -> List[str]:
 @app.on_event("startup")
 async def startup_event():
     """Initialize the retrieval chain on startup"""
-    global retrieval_chain, use_hybrid, all_documents
+    global retrieval_chain, general_chain, classification_chain, use_hybrid, all_documents
     
     try:
-        # Load processed documents
-        with open(PROCESSED_DATA_FILE, 'rb') as f:
-            all_documents = pickle.load(f)
-        
         # Initialize embeddings and LLM
         embeddings = GoogleGenerativeAIEmbeddings(model="models/embedding-001")
         llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0.3)
         
-        # Load FAISS vector store
-        vector_store = FAISS.load_local(
-            VECTOR_STORE_PATH,
-            embeddings,
-            allow_dangerous_deserialization=True
-        )
-        faiss_retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})
-        
-        # Try hybrid search
-        try:
-            bm25_retriever = BM25Retriever.from_documents(all_documents)
-            bm25_retriever.k = RETRIEVAL_K
+        # --- 1. Classification Chain ---
+        classification_prompt = ChatPromptTemplate.from_template(
+            """Analyze the following user query to determine the intent.
             
-            ensemble_retriever = EnsembleRetriever(
-                retrievers=[faiss_retriever, bm25_retriever],
-                weights=[0.7, 0.3]
-            )
-            use_hybrid = True
-            retriever = ensemble_retriever
-        except Exception as e:
-            print(f"Hybrid search failed, using FAISS only: {e}")
-            use_hybrid = False
-            retriever = faiss_retriever
+            Query: {input}
+            
+            Respond with exactly one of the following keywords:
+            
+            1. "GENERAL": Greeting, small talk, or non-legal questions (e.g., "Hi", "How are you?", "What is 2+2?").
+            2. "LEGAL_SEARCH": The user is asking a specific legal question, asking for case law, or mentioning specific legal terms/torts (e.g., "cases on medical negligence", "Section 302 IPC", "compensation for accident").
+            3. "LEGAL_HELP": The user is asking for help with a case but hasn't provided details yet (e.g., "I need help with a case", "Can you help me fight a lawsuit?", "I am a lawyer", "make my case stronger").
+            
+            Classification:"""
+        )
+        classification_chain = classification_prompt | llm | StrOutputParser()
+
+        # --- 2. General Conversation Chain ---
+        general_prompt = ChatPromptTemplate.from_template(
+            """You are CaseLawGPT, an intelligent AI assistant. 
+            You specialize in Indian Tort Law, but you can also engage in normal, helpful conversation.
+            
+            If the user asks who you are, explain that you are an AI Legal Research Assistant for Indian Tort Law.
+            If the user asks a general question, answer it naturally and helpfully.
+            Do not make up legal cases if asked about law in this mode; simply answer generally or suggest they ask a specific legal question for a deep search.
+            
+            User Query: {input}
+            
+            Answer:"""
+        )
+        general_chain = general_prompt | llm | StrOutputParser()
+
+        retriever = None
         
+        # 3. Try Pinecone (Cloud) first
+        if os.getenv("PINECONE_API_KEY"):
+            print("☁️ Connecting to Pinecone Vector Store...")
+            try:
+                vector_store = PineconeVectorStore(
+                    index_name=PINECONE_INDEX_NAME,
+                    embedding=embeddings
+                )
+                retriever = vector_store.as_retriever(search_kwargs={"k": RETRIEVAL_K})
+                print("✅ Connected to Pinecone successfully.")
+            except Exception as e:
+                print(f"⚠️ Pinecone connection failed: {e}")
+        
+        # Load processed documents for Hybrid Search (BM25) - Optional
+        # In a pure cloud setup, we might skip this or load from S3
+        if os.path.exists(PROCESSED_DATA_FILE):
+            with open(PROCESSED_DATA_FILE, 'rb') as f:
+                all_documents = pickle.load(f)
+                
+            # Try hybrid search if we have documents
+            try:
+                bm25_retriever = BM25Retriever.from_documents(all_documents)
+                bm25_retriever.k = RETRIEVAL_K
+                
+                if retriever:
+                    ensemble_retriever = EnsembleRetriever(
+                        retrievers=[retriever, bm25_retriever],
+                        weights=[0.7, 0.3]
+                    )
+                    use_hybrid = True
+                    retriever = ensemble_retriever
+            except Exception as e:
+                print(f"⚠️ Hybrid search setup failed: {e}")
+        
+        if retriever is None:
+             print("⚠️ WARNING: No retriever initialized. Queries will fail.")
+             return
+
         # Create prompt
         prompt = ChatPromptTemplate.from_template("""You are a legal research assistant specializing in Indian Supreme Court tort law cases.
 
@@ -216,40 +274,51 @@ async def get_stats():
 
 @app.post("/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
-    """Process a legal research query. Lightweight greeting handling to avoid over-answering simple salutations."""
+    """Process a legal research query or general conversation."""
     if retrieval_chain is None:
         raise HTTPException(status_code=503, detail="Service not initialized")
 
     raw = (request.query or "").strip()
-    lower_raw = raw.lower()
-    # Simple greeting / trivial input detection
-    GREETINGS = {"hi", "hello", "hey", "yo", "hola", "sup", "hii", "heyy"}
-    if lower_raw in GREETINGS or re.fullmatch(r"\b(?:hi|hello|hey)\b[!.]*", lower_raw):
-        return QueryResponse(
-            answer=(
-                "Hi! 👋 Please ask a substantive Indian tort law question. For example:\n\n"
-                "**Examples:**\n"
-                "* Motor accident compensation: 'Explain the multiplier method used in loss of dependency calculations.'\n"
-                "* Custodial violence: 'What principles govern compensation for illegal police detention?'\n"
-                "* Defamation: 'How does the Supreme Court distinguish libel and slander in civil liability?'\n\n"
-                "I will then retrieve the most relevant Supreme Court tort cases and summarize them with citations."
-            ),
-            sources=[],
-            search_type="System"
-        )
-
-    # Reject extremely short / non-informative inputs
-    token_like = re.findall(r"[a-zA-Z]{3,}", lower_raw)
-    if len(token_like) < 2:
-        return QueryResponse(
-            answer=(
-                "Please include more detail so I can search effectively. Add legal context, a tort type, or a specific issue."
-            ),
-            sources=[],
-            search_type="System"
-        )
+    if not raw:
+        return QueryResponse(answer="Please ask a question.", sources=[], search_type="System")
 
     try:
+        # 1. Classify Intent
+        intent = "LEGAL_SEARCH" # Default
+        if classification_chain:
+            try:
+                classification = classification_chain.invoke({"input": raw}).strip().upper()
+                if "GENERAL" in classification:
+                    intent = "GENERAL"
+                elif "LEGAL_HELP" in classification:
+                    intent = "LEGAL_HELP"
+            except Exception as e:
+                print(f"⚠️ Classification failed: {e}, defaulting to LEGAL_SEARCH")
+
+        # 2. Handle General Conversation
+        if intent == "GENERAL":
+            answer = general_chain.invoke({"input": raw})
+            return QueryResponse(
+                answer=answer,
+                sources=[],
+                search_type="General Chat (LLM)"
+            )
+            
+        # 3. Handle Vague Legal Help Requests
+        if intent == "LEGAL_HELP":
+            return QueryResponse(
+                answer=(
+                    "I'd be happy to help you strengthen your case. To give you the best legal precedents, I need a few more details:\n\n"
+                    "1. **What is the nature of the case?** (e.g., Medical Negligence, Motor Accident, Defamation)\n"
+                    "2. **What are the key facts?** (e.g., 'Hospital delayed treatment', 'Police refused FIR')\n"
+                    "3. **What specific legal issue are you fighting?** (e.g., 'Enhancement of compensation', 'Quashing of FIR')\n\n"
+                    "Once you provide these details, I can search for relevant Supreme Court judgments to support your arguments."
+                ),
+                sources=[],
+                search_type="System (Clarification)"
+            )
+
+        # 4. Handle Legal Research (Existing Logic)
         expanded_query = expand_legal_query(raw)
 
         statute_citations = detect_statute_citations(raw)
